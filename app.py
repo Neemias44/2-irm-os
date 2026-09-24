@@ -2,11 +2,14 @@ import customtkinter as ctk
 import sqlite3
 import json
 import os
+import shutil
+import hashlib
 import tempfile
 import threading
 import socket
 import textwrap
-from datetime import datetime
+import unicodedata
+from datetime import datetime, timedelta
 from tkinter import messagebox, filedialog, ttk
 
 # --- TENTA IMPORTAR O REPORTLAB (PDF) ---
@@ -40,6 +43,36 @@ try:
 except ImportError:
     TEM_IMPRESSORA = False
 
+
+class _ConexaoComFechoAutomatico:
+    """
+    Envolve uma conexão sqlite3 para garantir que ela seja FECHADA ao sair
+    do bloco 'with', além de manter o commit/rollback automático que o
+    sqlite3.Connection já faz nativamente.
+
+    Sem isso, cada 'with self.get_db_connection() as conn:' abria uma
+    conexão nova com o banco e nunca a fechava. Como o autocomplete
+    dispara uma busca (e portanto uma conexão nova) a cada tecla digitada,
+    ao longo de um dia inteiro de uso isso acumulava um número grande de
+    conexões abertas, podendo deixar o sistema lento ou travar depois de
+    muitas horas rodando.
+    """
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __enter__(self):
+        return self._conn.__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return self._conn.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self._conn.close()
+
+    def __getattr__(self, nome):
+        return getattr(self._conn, nome)
+
+
 class SistemaComanda(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -55,13 +88,17 @@ class SistemaComanda(ctk.CTk):
         self.total_itens = 0.0
         self.lista_sugestoes = None 
         self.ip_local = self.pegar_ip()
+        self._ui_busy = False
+        self._autocomplete_busy = False
+        self._lista_busy = {}
+        self._refresh_jobs = {}
+        self._refresh_geral_job = None
+        self._autocomplete_jobs = {}
 
         # Inicialização
         self.init_db()
+        self.fazer_backup_diario()
         self.estilizar_treeview() 
-        
-        if TEM_FLASK:
-            self.iniciar_servidor_celular()
 
         # Bind Global para fechar sugestões
         self.bind("<Button-1>", lambda e: self.verificar_foco_sugestao(e))
@@ -104,18 +141,150 @@ class SistemaComanda(ctk.CTk):
         
         style.map("Treeview.Heading", background=[("active", "#444444")])
 
+    def _executar_em_thread(self, funcao, *args, depois=None, em_erro=None):
+        if self._ui_busy:
+            return
+        self._ui_busy = True
+
+        def worker():
+            try:
+                resultado = funcao(*args)
+                if depois is not None:
+                    self.after(0, depois, resultado)
+            except Exception as exc:
+                if em_erro is not None:
+                    self.after(0, em_erro, exc)
+                else:
+                    self.after(0, lambda: messagebox.showerror("Erro", str(exc)))
+            finally:
+                self.after(0, self._desbloquear_ui)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _desbloquear_ui(self):
+        self._ui_busy = False
+
+    def _agendar_refresh_lista(self, chave, callback, delay=150):
+        job = self._refresh_jobs.get(chave)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+        self._refresh_jobs[chave] = self.after(delay, callback)
+
+    def _agendar_refresh_geral(self, delay=200):
+        if self._refresh_geral_job is not None:
+            try:
+                self.after_cancel(self._refresh_geral_job)
+            except Exception:
+                pass
+        self._refresh_geral_job = self.after(delay, self._refresh_geral)
+
+    def _refresh_geral(self):
+        self._refresh_geral_job = None
+        self.atualizar_lista_produtos()
+        self.atualizar_lista_clientes()
+        self.atualizar_lista_vendas()
+
+    def _agendar_autocomplete(self, campo, tabela, delay=180):
+        chave = (id(campo), tabela)
+        job = self._autocomplete_jobs.get(chave)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+        self._autocomplete_jobs[chave] = self.after(delay, lambda: self._buscar_autocomplete_ativo(campo, tabela))
+
+    def _buscar_autocomplete_ativo(self, campo, tabela):
+        self._autocomplete_jobs.pop((id(campo), tabela), None)
+        self.mostrar_autocomplete_verdadeiro(campo, tabela)
+
     # --- UTILITÁRIOS ---
     def safe_float(self, valor):
         try:
-            if not valor or str(valor).strip() == "": return 0.0
-            return float(str(valor).replace(",", "."))
-        except: return 0.0
-            
+            if valor is None:
+                return 0.0
+            if isinstance(valor, (int, float)):
+                return float(valor)
+            texto = str(valor).strip()
+            if texto == "":
+                return 0.0
+
+            texto = texto.replace(" ", "")
+            if "," in texto and "." in texto:
+                if texto.rfind(",") > texto.rfind("."):
+                    texto = texto.replace(".", "").replace(",", ".")
+                else:
+                    texto = texto.replace(",", "")
+            elif "," in texto:
+                texto = texto.replace(",", ".")
+
+            return float(texto)
+        except Exception:
+            return 0.0
+
     def safe_int(self, valor):
         try:
-            if not valor or str(valor).strip() == "": return 0
-            return int(float(str(valor)))
-        except: return 0
+            if valor is None:
+                return 0
+            if isinstance(valor, int):
+                return valor
+            if isinstance(valor, float):
+                return int(valor)
+
+            texto = str(valor).strip()
+            if texto == "":
+                return 0
+
+            texto = texto.replace(" ", "")
+            if "," in texto and "." in texto:
+                if texto.rfind(",") > texto.rfind("."):
+                    texto = texto.replace(".", "").replace(",", ".")
+                else:
+                    texto = texto.replace(",", "")
+            elif "," in texto:
+                texto = texto.replace(",", ".")
+
+            return int(float(texto))
+        except Exception:
+            return 0
+
+    def normalizar_nome(self, valor):
+        if valor is None:
+            return ""
+        texto = str(valor).strip()
+        texto = " ".join(texto.split())
+        texto = unicodedata.normalize("NFKD", texto)
+        texto = "".join(ch for ch in texto if not unicodedata.combining(ch))
+        return texto.upper()
+
+    def _buscar_produto_por_nome(self, nome):
+        nome_norm = self.normalizar_nome(nome)
+        if not nome_norm:
+            return None
+        with self.get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, nome, preco, estoque FROM prods ORDER BY nome")
+            resultados = cursor.fetchall()
+        for pid, nome_db, preco, estoque in resultados:
+            if self.normalizar_nome(nome_db) == nome_norm:
+                return (pid, nome_db, preco, estoque)
+        return None
+
+    def _buscar_cliente_por_nome(self, nome):
+        nome_norm = self.normalizar_nome(nome)
+        if not nome_norm:
+            return None
+        with self.get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, nome, endereco FROM clientes ORDER BY nome")
+            resultados = cursor.fetchall()
+        for cid, nome_db, endereco in resultados:
+            if self.normalizar_nome(nome_db) == nome_norm:
+                return (cid, nome_db, endereco)
+        return None
 
     def pegar_ip(self):
         try:
@@ -129,7 +298,7 @@ class SistemaComanda(ctk.CTk):
 
     # --- BANCO DE DADOS (THREAD SAFE) ---
     def get_db_connection(self):
-        return sqlite3.connect("loja.db", timeout=30)
+        return _ConexaoComFechoAutomatico(sqlite3.connect("loja.db", timeout=30))
 
     def init_db(self):
         try:
@@ -154,8 +323,130 @@ class SistemaComanda(ctk.CTk):
         except sqlite3.Error as e:
             messagebox.showerror("Erro de Banco", f"Erro ao inicializar: {e}")
 
+    # --- SALVAR / BACKUP MANUAL (com verificação de mudanças e log) ---
+    def _hash_arquivo(self, caminho):
+        """Calcula uma 'impressão digital' (SHA-256) do conteúdo do arquivo,
+        usada para saber se o loja.db mudou desde o último backup."""
+        h = hashlib.sha256()
+        with open(caminho, "rb") as f:
+            for bloco in iter(lambda: f.read(8192), b""):
+                h.update(bloco)
+        return h.hexdigest()
+
+    def salvar_backup_manual(self):
+        if self._ui_busy:
+            return
+
+        self._executar_em_thread(self._salvar_backup_manual_real)
+
+    def _salvar_backup_manual_real(self):
+        if not os.path.exists("loja.db"):
+            self.after(0, lambda: messagebox.showwarning("Salvar Informações", "Arquivo loja.db não encontrado nesta pasta."))
+            return
+
+        pasta_backup = "backups"
+        os.makedirs(pasta_backup, exist_ok=True)
+        caminho_hash = os.path.join(pasta_backup, "ultimo_hash.txt")
+        caminho_log = os.path.join(pasta_backup, "log_backups.txt")
+
+        try:
+            hash_atual = self._hash_arquivo("loja.db")
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror("Salvar Informações", f"Não foi possível ler o loja.db: {e}"))
+            return
+
+        hash_anterior = None
+        if os.path.exists(caminho_hash):
+            try:
+                with open(caminho_hash, "r", encoding="utf-8") as f:
+                    hash_anterior = f.read().strip()
+            except Exception:
+                hash_anterior = None
+
+        agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+        if hash_anterior == hash_atual:
+            linha_log = f"[{agora}] Verificado — nenhuma informação nova desde o último salvamento.\n"
+            resultado = "sem_mudanca"
+        else:
+            nome_backup = f"loja_backup_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.db"
+            caminho_backup = os.path.join(pasta_backup, nome_backup)
+            try:
+                shutil.copy2("loja.db", caminho_backup)
+                with open(caminho_hash, "w", encoding="utf-8") as f:
+                    f.write(hash_atual)
+                linha_log = f"[{agora}] Informações salvas com sucesso: {nome_backup}\n"
+                resultado = "salvo"
+            except Exception as e:
+                linha_log = f"[{agora}] ERRO ao salvar backup: {e}\n"
+                resultado = "erro"
+
+        try:
+            with open(caminho_log, "a", encoding="utf-8") as f:
+                f.write(linha_log)
+        except Exception:
+            pass
+
+        self.after(0, self._mostrar_janela_log_backup, resultado, caminho_log)
+
+    def _mostrar_janela_log_backup(self, resultado, caminho_log):
+        janela = ctk.CTkToplevel(self)
+        janela.title("Salvar Informações")
+        janela.geometry("560x420")
+        janela.transient(self)
+        janela.grab_set()
+
+        if resultado == "salvo":
+            titulo, cor = "✅ Informações salvas com sucesso!", "#4CAF50"
+        elif resultado == "sem_mudanca":
+            titulo, cor = "ℹ️ Nada de diferente — nenhuma alteração encontrada", "#FF9800"
+        else:
+            titulo, cor = "❌ Erro ao salvar", "#f44336"
+
+        ctk.CTkLabel(janela, text=titulo, font=("Arial", 16, "bold"), text_color=cor).pack(pady=(15, 10))
+        ctk.CTkLabel(janela, text="Histórico (log) de salvamentos:", text_color="gray").pack(anchor="w", padx=15)
+
+        caixa = ctk.CTkTextbox(janela, width=520, height=280)
+        caixa.pack(padx=15, pady=5, fill="both", expand=True)
+
+        try:
+            with open(caminho_log, "r", encoding="utf-8") as f:
+                linhas = f.readlines()
+            texto_log = "".join(linhas[-30:])  # mostra as últimas 30 entradas
+        except Exception:
+            texto_log = "(sem histórico ainda)"
+
+        caixa.insert("1.0", texto_log)
+        caixa.see("end")
+        caixa.configure(state="disabled")
+
+        ctk.CTkButton(janela, text="Fechar", command=janela.destroy).pack(pady=10)
+
+    # --- BACKUP AUTOMÁTICO ---
+    def fazer_backup_diario(self):
+        """
+        Copia o loja.db para a pasta backups/ uma vez por dia (na primeira
+        vez que o programa é aberto naquele dia). Nunca escreve no loja.db
+        original — só lê e copia. Se já existir um backup de hoje, não faz
+        nada de novo.
+        """
+        try:
+            if not os.path.exists("loja.db"):
+                return
+            pasta_backup = "backups"
+            os.makedirs(pasta_backup, exist_ok=True)
+            nome_backup = f"loja_backup_{datetime.now().strftime('%Y-%m-%d')}.db"
+            caminho_backup = os.path.join(pasta_backup, nome_backup)
+            if not os.path.exists(caminho_backup):
+                shutil.copy2("loja.db", caminho_backup)
+        except Exception as e:
+            print(f"Aviso: não foi possível fazer backup automático do banco: {e}")
+
     # --- SERVIDOR CELULAR (FLASK) ---
     def iniciar_servidor_celular(self):
+        if getattr(self, '_servidor_celular_ativo', False):
+            return
+        self._servidor_celular_ativo = True
         app = Flask(__name__)
         HTML_TEMPLATE = """
         <!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -276,50 +567,50 @@ class SistemaComanda(ctk.CTk):
 
     # --- FUNÇÃO DE EXPORTAÇÃO PDF (ATUALIZADA) ---
     def exportar_relatorio_pdf_geral(self):
+        if self._ui_busy:
+            return
         if not TEM_REPORTLAB:
-            return messagebox.showerror("Erro", "Instale a biblioteca: pip install reportlab")
+            return self.after(0, lambda: messagebox.showerror("Erro", "Instale a biblioteca: pip install reportlab"))
 
+        self._executar_em_thread(self._exportar_relatorio_pdf_geral_real)
+
+    def _exportar_relatorio_pdf_geral_real(self):
         hoje = datetime.now().strftime("%d/%m/%Y")
-        
-        # 1. Dados Financeiros
+
         with self.get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT forma, COUNT(*), SUM(total) FROM historico WHERE data LIKE ? GROUP BY forma", (f"{hoje}%",))
             dados_vendas = cursor.fetchall()
 
-        # 2. Dados de Produtos Vendidos (Nova Lógica)
         dados_itens_vendidos = self.calcular_produtos_vendidos_hoje()
-
-        # 3. Configuração do PDF
-        filename = filedialog.asksaveasfilename(defaultextension=".pdf", 
+        filename = filedialog.asksaveasfilename(defaultextension=".pdf",
                                                 filetypes=[("PDF files", "*.pdf")],
                                                 initialfile=f"Relatorio_Vendas_{datetime.now().strftime('%d-%m-%Y')}.pdf")
-        if not filename: return
+        if not filename:
+            return
 
         try:
             doc = SimpleDocTemplate(filename, pagesize=A4)
             elements = []
             styles = getSampleStyleSheet()
-            
-            # Título
+
             elements.append(Paragraph(f"Relatório de Vendas - {hoje}", styles['Title']))
             elements.append(Paragraph("Sistema Dois Irmãos", styles['Normal']))
             elements.append(Spacer(1, 20))
 
-            # --- SEÇÃO 1: FINANCEIRO ---
             elements.append(Paragraph("<b>RESUMO FINANCEIRO</b>", styles['Heading2']))
             elements.append(Spacer(1, 10))
 
             data_vendas = [['Forma Pagamento', 'Qtd Vendas', 'Valor Total (R$)']]
             total_geral = 0.0
             qtd_geral = 0
-            
+
             for forma, qtd, valor in dados_vendas:
                 if forma:
                     data_vendas.append([forma, str(qtd), f"R$ {valor:.2f}"])
                     total_geral += valor
                     qtd_geral += qtd
-            
+
             data_vendas.append(['TOTAL GERAL', str(qtd_geral), f"R$ {total_geral:.2f}"])
 
             t_vendas = Table(data_vendas, colWidths=[200, 100, 150])
@@ -336,7 +627,6 @@ class SistemaComanda(ctk.CTk):
             elements.append(t_vendas)
             elements.append(Spacer(1, 30))
 
-            # --- SEÇÃO 2: QUANTIDADE DE ITENS VENDIDOS (ALTERADO) ---
             elements.append(Paragraph("<b>RESUMO DE ITENS VENDIDOS (SAÍDAS)</b>", styles['Heading2']))
             elements.append(Spacer(1, 10))
 
@@ -348,7 +638,6 @@ class SistemaComanda(ctk.CTk):
                 data_itens.append([nome, qtd_fmt])
                 total_itens_vendidos += qtd
 
-            # Linha de total de itens
             data_itens.append(['TOTAL DE VOLUMES/ITENS', f"{total_itens_vendidos:.0f}"])
 
             t_itens = Table(data_itens, colWidths=[350, 100])
@@ -360,18 +649,245 @@ class SistemaComanda(ctk.CTk):
                 ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
                 ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
                 ('ROWBACKGROUNDS', (0, 1), (-2, -1), [colors.whitesmoke, colors.lightgrey]),
-                ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'), # Negrito no total
+                ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
                 ('BACKGROUND', (0, -1), (-1, -1), colors.lightyellow),
             ]))
             elements.append(t_itens)
 
             doc.build(elements)
-            messagebox.showinfo("Sucesso", f"PDF salvo em:\n{filename}")
+            self.after(0, lambda: messagebox.showinfo("Sucesso", f"PDF salvo em:\n{filename}"))
+            try:
+                self.after(0, lambda: os.startfile(filename))
+            except Exception:
+                pass
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror("Erro PDF", f"Falha ao criar PDF: {str(e)}"))
+
+    # =========================================================================
+    # RELATÓRIOS POR PERÍODO (MENSAL / 6 MESES / ANUAL)
+    # =========================================================================
+    def _parse_data_historico(self, data_str):
+        """Converte uma data salva como 'DD/MM/YYYY HH:MM' (formato usado em
+        historico e entradas_estoque) para datetime. Retorna None se não
+        conseguir interpretar (registro antigo/corrompido é apenas ignorado
+        do relatório, nunca quebra a geração)."""
+        if not data_str:
+            return None
+        try:
+            return datetime.strptime(data_str, "%d/%m/%Y %H:%M")
+        except Exception:
+            try:
+                return datetime.strptime(data_str[:10], "%d/%m/%Y")
+            except Exception:
+                return None
+
+    def _coletar_dados_periodo(self, data_inicio, data_fim):
+        """Busca TODAS as vendas (historico) e TODAS as entradas de estoque
+        (entradas_estoque), filtra pelo período [data_inicio, data_fim] e
+        devolve os dados já somados: financeiro por forma de pagamento,
+        produtos vendidos (saídas) e produtos recebidos (entradas)."""
+        with self.get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT data, cliente, total, forma, taxa, itens_json FROM historico")
+            todas_vendas = cursor.fetchall()
+            cursor.execute("SELECT nome_prod, qtd, data FROM entradas_estoque")
+            todas_entradas = cursor.fetchall()
+
+        financeiro_por_forma = {}
+        produtos_vendidos = {}
+        total_geral = 0.0
+        qtd_vendas = 0
+
+        for data, cliente, total, forma, taxa, itens_json in todas_vendas:
+            dt = self._parse_data_historico(data)
+            if not dt or not (data_inicio <= dt <= data_fim):
+                continue
+            qtd_vendas += 1
+            total_geral += float(total or 0.0)
+            if forma:
+                if forma not in financeiro_por_forma:
+                    financeiro_por_forma[forma] = {"qtd": 0, "valor": 0.0}
+                financeiro_por_forma[forma]["qtd"] += 1
+                financeiro_por_forma[forma]["valor"] += float(total or 0.0)
+            try:
+                itens = json.loads(itens_json) if itens_json else []
+                if isinstance(itens, list):
+                    for item in itens:
+                        if not isinstance(item, dict):
+                            continue
+                        nome = item.get('n')
+                        qtd = item.get('q')
+                        if not nome or qtd is None:
+                            continue
+                        try:
+                            qtd_float = float(qtd)
+                        except (TypeError, ValueError):
+                            continue
+                        produtos_vendidos[nome] = produtos_vendidos.get(nome, 0.0) + qtd_float
+            except Exception:
+                pass
+
+        produtos_entrada = {}
+        qtd_entradas = 0
+        for nome_prod, qtd, data in todas_entradas:
+            dt = self._parse_data_historico(data)
+            if not dt or not (data_inicio <= dt <= data_fim):
+                continue
+            qtd_entradas += 1
+            if nome_prod is None:
+                continue
+            try:
+                qtd_valor = float(qtd or 0)
+            except (TypeError, ValueError):
+                qtd_valor = 0.0
+            produtos_entrada[nome_prod] = produtos_entrada.get(nome_prod, 0.0) + qtd_valor
+
+        return {
+            "qtd_vendas": qtd_vendas,
+            "total_geral": total_geral,
+            "financeiro_por_forma": financeiro_por_forma,
+            "produtos_vendidos": sorted(produtos_vendidos.items()),
+            "qtd_entradas": qtd_entradas,
+            "produtos_entrada": sorted(produtos_entrada.items()),
+        }
+
+    def _formatar_qtd(self, qtd):
+        return f"{qtd:.0f}" if float(qtd).is_integer() else f"{qtd:.2f}"
+
+    def _gerar_pdf_periodo(self, titulo_periodo, data_inicio, data_fim):
+        if not TEM_REPORTLAB:
+            return messagebox.showerror("Erro", "Instale a biblioteca: pip install reportlab")
+
+        dados = self._coletar_dados_periodo(data_inicio, data_fim)
+
+        nome_sugerido = f"Relatorio_{titulo_periodo}".replace(" ", "_").replace("/", "-")
+        filename = filedialog.asksaveasfilename(defaultextension=".pdf",
+                                                filetypes=[("PDF files", "*.pdf")],
+                                                initialfile=f"{nome_sugerido}.pdf")
+        if not filename:
+            return
+
+        try:
+            doc = SimpleDocTemplate(filename, pagesize=A4)
+            elements = []
+            styles = getSampleStyleSheet()
+
+            elements.append(Paragraph(f"Relatório {titulo_periodo}", styles['Title']))
+            elements.append(Paragraph("Sistema Dois Irmãos", styles['Normal']))
+            elements.append(Paragraph(
+                f"Período: {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}",
+                styles['Normal']))
+            elements.append(Spacer(1, 20))
+
+            # --- RESUMO FINANCEIRO (VENDAS) ---
+            elements.append(Paragraph("<b>RESUMO FINANCEIRO (VENDAS)</b>", styles['Heading2']))
+            elements.append(Spacer(1, 10))
+
+            data_fin = [['Forma Pagamento', 'Qtd Vendas', 'Valor Total (R$)']]
+            for forma, info in dados["financeiro_por_forma"].items():
+                data_fin.append([forma, str(info["qtd"]), f"R$ {info['valor']:.2f}"])
+            data_fin.append(['TOTAL GERAL', str(dados["qtd_vendas"]), f"R$ {dados['total_geral']:.2f}"])
+
+            t_fin = Table(data_fin, colWidths=[200, 100, 150])
+            t_fin.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+                ('BACKGROUND', (0, -1), (-1, -1), colors.lightgrey),
+            ]))
+            elements.append(t_fin)
+            elements.append(Spacer(1, 20))
+
+            # --- PRODUTOS VENDIDOS (SAÍDAS) ---
+            elements.append(Paragraph("<b>PRODUTOS VENDIDOS (SAÍDAS)</b>", styles['Heading2']))
+            elements.append(Spacer(1, 10))
+
+            data_saida = [['Produto', 'Quantidade Vendida']]
+            for nome, qtd in dados["produtos_vendidos"]:
+                data_saida.append([nome, self._formatar_qtd(qtd)])
+            if len(data_saida) == 1:
+                data_saida.append(["(nenhuma venda no período)", "-"])
+
+            t_saida = Table(data_saida, colWidths=[350, 130])
+            t_saida.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                ('ALIGN', (1, 0), (1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
+            ]))
+            elements.append(t_saida)
+            elements.append(Spacer(1, 20))
+
+            # --- ENTRADAS DE ESTOQUE (COMPRAS/REPOSIÇÃO) ---
+            elements.append(Paragraph(
+                f"<b>ENTRADAS DE MERCADORIA — {dados['qtd_entradas']} registro(s) no período</b>",
+                styles['Heading2']))
+            elements.append(Spacer(1, 10))
+
+            data_entrada = [['Produto', 'Quantidade Recebida']]
+            for nome, qtd in dados["produtos_entrada"]:
+                data_entrada.append([nome, self._formatar_qtd(qtd)])
+            if len(data_entrada) == 1:
+                data_entrada.append(["(nenhuma entrada no período)", "-"])
+
+            t_entrada = Table(data_entrada, colWidths=[350, 130])
+            t_entrada.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#FF9800")),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                ('ALIGN', (1, 0), (1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
+            ]))
+            elements.append(t_entrada)
+
+            doc.build(elements)
+            messagebox.showinfo("Sucesso", f"Relatório salvo em:\n{filename}")
             try: os.startfile(filename)
             except: pass
 
         except Exception as e:
-            messagebox.showerror("Erro PDF", f"Falha ao criar PDF: {str(e)}")
+            messagebox.showerror("Erro PDF", f"Falha ao criar relatório: {str(e)}")
+
+    def gerar_relatorio_mensal(self):
+        try:
+            mes = int(self.combo_mes_rel.get().split(" - ")[0])
+            ano = int(self.combo_ano_mes_rel.get())
+        except Exception:
+            return messagebox.showwarning("Erro", "Selecione um mês e ano válidos.")
+
+        data_inicio = datetime(ano, mes, 1, 0, 0, 0)
+        if mes == 12:
+            data_fim = datetime(ano, 12, 31, 23, 59, 59)
+        else:
+            data_fim = datetime(ano, mes + 1, 1) - timedelta(seconds=1)
+
+        titulo = f"Mensal - {self.combo_mes_rel.get().split(' - ')[1]} de {ano}"
+        self._gerar_pdf_periodo(titulo, data_inicio, data_fim)
+
+    def gerar_relatorio_6_meses(self):
+        data_fim = datetime.now()
+        data_inicio = (data_fim - timedelta(days=182)).replace(hour=0, minute=0, second=0)
+        titulo = f"6 Meses ({data_inicio.strftime('%d-%m-%Y')} a {data_fim.strftime('%d-%m-%Y')})"
+        self._gerar_pdf_periodo(titulo, data_inicio, data_fim)
+
+    def gerar_relatorio_anual(self):
+        try:
+            ano = int(self.combo_ano_anual_rel.get())
+        except Exception:
+            return messagebox.showwarning("Erro", "Selecione um ano válido.")
+        data_inicio = datetime(ano, 1, 1, 0, 0, 0)
+        data_fim = datetime(ano, 12, 31, 23, 59, 59)
+        titulo = f"Anual - {ano}"
+        self._gerar_pdf_periodo(titulo, data_inicio, data_fim)
 
     # --- AUTOCOMPLETE ---
     def fechar_sugestoes(self):
@@ -386,23 +902,33 @@ class SistemaComanda(ctk.CTk):
         if campo == self.ent_prod_venda: self.ent_qtd.focus()
 
     def mostrar_autocomplete(self, event, campo, tabela):
-        if event.keysym in ["Up", "Down", "Return", "Escape", "Tab"]: return
+        if event.keysym in ["Up", "Down", "Return", "Escape", "Tab"]:
+            return
+        self._agendar_autocomplete(campo, tabela, delay=180)
+
+    def mostrar_autocomplete_verdadeiro(self, campo, tabela):
+        if self._autocomplete_busy:
+            return
         texto = campo.get().upper().strip()
-        if not texto: self.fechar_sugestoes(); return
-        
+        if not texto:
+            self.fechar_sugestoes(); return
+
+        self._autocomplete_busy = True
         def buscar():
             try:
                 with self.get_db_connection() as conn:
                     cursor = conn.cursor()
                     cursor.execute(f"SELECT nome FROM {tabela} WHERE nome LIKE ? LIMIT 6", (f'%{texto}%',))
                     sugestoes = [r[0] for r in cursor.fetchall()]
-                
+
                 if sugestoes:
                     self.after(0, lambda: self._desenhar_sugestoes(campo, sugestoes, tabela))
                 else:
                     self.after(0, self.fechar_sugestoes)
             except: pass
-            
+            finally:
+                self.after(0, lambda: setattr(self, '_autocomplete_busy', False))
+
         threading.Thread(target=buscar, daemon=True).start()
     
     def _desenhar_sugestoes(self, campo, sugestoes, tabela):
@@ -429,6 +955,7 @@ class SistemaComanda(ctk.CTk):
         self.f_esq.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
         
         ctk.CTkButton(self.f_esq, text="📱 IP CELULAR", fg_color="#673AB7", command=self.mostrar_info_celular).pack(fill="x", padx=10, pady=5)
+        ctk.CTkButton(self.f_esq, text="💾 SALVAR INFORMAÇÕES", fg_color="#009688", command=self.salvar_backup_manual).pack(fill="x", padx=10, pady=5)
         
         self.lbl_modo_edicao = ctk.CTkLabel(self.f_esq, text="MODO EDIÇÃO", fg_color="red"); self.lbl_modo_edicao.pack(fill="x", pady=5); self.lbl_modo_edicao.pack_forget()
         
@@ -511,7 +1038,7 @@ class SistemaComanda(ctk.CTk):
         ctk.CTkButton(f_acoes, text="EXCLUIR SELECIONADO(S)", fg_color="red", command=self.excluir_clientes_selecionados).pack(side="left", padx=5)
         
         self.ent_busca_cli = ctk.CTkEntry(self.tab_clientes, placeholder_text="Buscar Cliente..."); self.ent_busca_cli.pack(fill="x", padx=10, pady=5)
-        self.ent_busca_cli.bind("<KeyRelease>", lambda e: self.atualizar_lista_clientes())
+        self.ent_busca_cli.bind("<KeyRelease>", lambda e: self._agendar_refresh_lista("clientes", self._realizar_atualizacao_clientes, delay=220))
         
         f_tree = ctk.CTkFrame(self.tab_clientes, fg_color="transparent")
         f_tree.pack(fill="both", expand=True, padx=10, pady=5)
@@ -545,7 +1072,7 @@ class SistemaComanda(ctk.CTk):
 
         f_busca = ctk.CTkFrame(self.tab_produtos); f_busca.pack(fill="x", padx=10, pady=5)
         self.ent_busca_prod = ctk.CTkEntry(f_busca, placeholder_text="🔍 Filtrar tabela..."); self.ent_busca_prod.pack(side="left", fill="x", expand=True, padx=5)
-        self.ent_busca_prod.bind("<KeyRelease>", lambda e: self.atualizar_lista_produtos())
+        self.ent_busca_prod.bind("<KeyRelease>", lambda e: self._agendar_refresh_lista("produtos", self._realizar_atualizacao_produtos, delay=220))
         
         ctk.CTkButton(f_busca, text="✏ EDITAR", width=100, fg_color="#007bff", command=self.carregar_produto_para_edicao).pack(side="left", padx=5)
         ctk.CTkButton(f_busca, text="🗑 EXCLUIR", width=100, fg_color="red", command=self.excluir_produtos_selecionados).pack(side="left", padx=5)
@@ -573,15 +1100,15 @@ class SistemaComanda(ctk.CTk):
         f = ctk.CTkFrame(self.tab_relatorio); f.pack(fill="x", padx=10, pady=10)
         self.ent_id_rel = ctk.CTkEntry(f, placeholder_text="ID", width=60)
         self.ent_id_rel.pack(side="left", padx=5)
-        self.ent_id_rel.bind("<KeyRelease>", lambda e: self.atualizar_lista_vendas())
+        self.ent_id_rel.bind("<KeyRelease>", lambda e: self._agendar_refresh_lista("vendas", self._realizar_atualizacao_vendas, delay=220))
 
         self.ent_data_rel = ctk.CTkEntry(f, placeholder_text="Data (DD/MM/YYYY)", width=140)
         self.ent_data_rel.pack(side="left", padx=5)
-        self.ent_data_rel.bind("<KeyRelease>", lambda e: self.atualizar_lista_vendas())
+        self.ent_data_rel.bind("<KeyRelease>", lambda e: self._agendar_refresh_lista("vendas", self._realizar_atualizacao_vendas, delay=220))
 
         self.ent_cli_rel = ctk.CTkEntry(f, placeholder_text="Filtrar por Nome do Cliente...", width=200)
         self.ent_cli_rel.pack(side="left", fill="x", expand=True, padx=5)
-        self.ent_cli_rel.bind("<KeyRelease>", lambda e: self.atualizar_lista_vendas())
+        self.ent_cli_rel.bind("<KeyRelease>", lambda e: self._agendar_refresh_lista("vendas", self._realizar_atualizacao_vendas, delay=220))
 
         # BOTOES UNIFICADOS
         ctk.CTkButton(f, text="🖨 IMPRIMIR GERAL", width=140, fg_color="orange", command=self.relatorio_geral_dia).pack(side="right", padx=5)
@@ -591,7 +1118,40 @@ class SistemaComanda(ctk.CTk):
         ctk.CTkButton(f_acoes, text="REIMPRIMIR CUPOM", fg_color="grey", command=self.reimprimir_cupom).pack(side="left", padx=5)
         ctk.CTkButton(f_acoes, text="EDITAR VENDA", fg_color="purple", command=self.editar_venda_antiga).pack(side="left", padx=5)
         ctk.CTkButton(f_acoes, text="EXCLUIR", fg_color="red", command=self.excluir_vendas_selecionadas).pack(side="left", padx=5)
-        
+
+        # --- RELATÓRIOS POR PERÍODO (MENSAL / 6 MESES / ANUAL) ---
+        f_periodo = ctk.CTkFrame(self.tab_relatorio, border_color="#673AB7", border_width=2)
+        f_periodo.pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(f_periodo, text="📊 RELATÓRIOS POR PERÍODO (vendas + entradas de estoque)",
+                     font=("Arial", 12, "bold"), text_color="#673AB7").pack(anchor="w", padx=10, pady=(8, 5))
+
+        ano_atual = datetime.now().year
+        anos_disponiveis = [str(a) for a in range(ano_atual - 4, ano_atual + 1)][::-1]
+        nomes_meses = ["01 - Janeiro", "02 - Fevereiro", "03 - Março", "04 - Abril", "05 - Maio", "06 - Junho",
+                       "07 - Julho", "08 - Agosto", "09 - Setembro", "10 - Outubro", "11 - Novembro", "12 - Dezembro"]
+
+        # Linha: relatório mensal
+        f_mes = ctk.CTkFrame(f_periodo, fg_color="transparent"); f_mes.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(f_mes, text="Mensal:", width=70, anchor="w").pack(side="left")
+        self.combo_mes_rel = ctk.CTkOptionMenu(f_mes, values=nomes_meses, width=150)
+        self.combo_mes_rel.set(nomes_meses[datetime.now().month - 1])
+        self.combo_mes_rel.pack(side="left", padx=5)
+        self.combo_ano_mes_rel = ctk.CTkOptionMenu(f_mes, values=anos_disponiveis, width=90)
+        self.combo_ano_mes_rel.pack(side="left", padx=5)
+        ctk.CTkButton(f_mes, text="📄 GERAR RELATÓRIO MENSAL", fg_color="#673AB7",
+                      command=self.gerar_relatorio_mensal).pack(side="left", padx=10)
+
+        # Linha: relatório 6 meses + anual
+        f_outros = ctk.CTkFrame(f_periodo, fg_color="transparent"); f_outros.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(f_outros, text="📄 GERAR RELATÓRIO 6 MESES", fg_color="#3F51B5",
+                      command=self.gerar_relatorio_6_meses).pack(side="left", padx=(0, 10))
+
+        ctk.CTkLabel(f_outros, text="Anual:", width=50, anchor="w").pack(side="left", padx=(10, 0))
+        self.combo_ano_anual_rel = ctk.CTkOptionMenu(f_outros, values=anos_disponiveis, width=90)
+        self.combo_ano_anual_rel.pack(side="left", padx=5)
+        ctk.CTkButton(f_outros, text="📄 GERAR RELATÓRIO ANUAL", fg_color="#009688",
+                      command=self.gerar_relatorio_anual).pack(side="left", padx=10)
+
         f_tree = ctk.CTkFrame(self.tab_relatorio, fg_color="transparent")
         f_tree.pack(fill="both", expand=True, padx=10, pady=5)
         self.cols_rel = ("ID", "DATA", "CLIENTE", "TOTAL", "FORMA")
@@ -629,24 +1189,21 @@ class SistemaComanda(ctk.CTk):
         self.atualizar_totais()
 
     def add_item(self):
-        nome = self.ent_prod_venda.get().upper()
-        if not nome: return
-        
-        with self.get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT preco, estoque FROM prods WHERE nome=?", (nome,))
-            res = cursor.fetchone()
-        
+        nome = self.normalizar_nome(self.ent_prod_venda.get())
+        if not nome:
+            return
+
+        res = self._buscar_produto_por_nome(nome)
         if res:
+            _, nome_real, preco, estoque_atual = res
             q_solicitada = self.safe_float(self.ent_qtd.get()) or 1
-            estoque_atual = res[1]
             if estoque_atual < q_solicitada:
                 if not messagebox.askyesno("Estoque Baixo", f"ATENÇÃO: Só há {estoque_atual} un.\nVender mesmo assim?"): return
 
-            sub = q_solicitada * res[0]
-            self.carrinho.append({"n": nome, "q": q_solicitada, "t": sub, "vu": res[0]})
+            sub = q_solicitada * preco
+            self.carrinho.append({"n": nome_real.upper(), "q": q_solicitada, "t": sub, "vu": preco})
             self.renderizar_carrinho()
-            
+
             self.ent_prod_venda.delete(0, 'end'); self.ent_qtd.delete(0, 'end'); self.ent_qtd.insert(0, "1"); self.ent_prod_venda.focus()
         else:
             messagebox.showwarning("Erro", "Produto não encontrado")
@@ -686,96 +1243,170 @@ class SistemaComanda(ctk.CTk):
         self.lbl_total.configure(text=f"TOTAL: R$ {tot:.2f}")
 
     def finalizar_venda(self, imprimir=True):
-        if not self.carrinho: return messagebox.showwarning("Vazio", "Carrinho vazio!")
-        
-        cli = self.ent_cli.get().upper() or "CONSUMIDOR"
-        end = self.ent_end.get().upper()
+        if not self.carrinho:
+            return self.after(0, lambda: messagebox.showwarning("Vazio", "Carrinho vazio!"))
+
+        cli = (self.ent_cli.get() or "").upper().strip() or "CONSUMIDOR"
+        end = (self.ent_end.get() or "").upper().strip()
         pgto = self.forma_pagamento.get()
         tx = self.safe_float(self.ent_taxa_entrega.get())
         total = self.total_itens + tx
         val_pago = self.safe_float(self.ent_valor_pago.get())
-        data_hora = datetime.now().strftime("%d/%m/%Y %H:%M")
-        
-        try:
-            with self.get_db_connection() as conn:
-                cursor = conn.cursor()
-                
-                if cli != "CONSUMIDOR":
-                    cursor.execute("SELECT id FROM clientes WHERE nome=?", (cli,))
-                    if not cursor.fetchone():
-                        cursor.execute("INSERT INTO clientes (nome, endereco) VALUES (?,?)", (cli, end))
 
-                for item in self.carrinho:
-                    cursor.execute("UPDATE prods SET estoque = estoque - ? WHERE nome = ?", (item['q'], item['n']))
+        def tarefa():
+            data_hora = datetime.now().strftime("%d/%m/%Y %H:%M")
+            try:
+                with self.get_db_connection() as conn:
+                    cursor = conn.cursor()
 
-                if self.id_venda_em_edicao:
-                    cursor.execute("UPDATE historico SET data=?, cliente=?, total=?, forma=?, taxa=?, itens_json=? WHERE id=?",
-                                   (data_hora, cli, total, pgto, tx, json.dumps(self.carrinho), self.id_venda_em_edicao))
-                    self.id_venda_em_edicao = None
-                    self.lbl_modo_edicao.pack_forget()
-                    self.btn_salvar_apenas.configure(text="SALVAR (F4)")
-                    self.btn_finalizar.configure(text="IMPRIMIR (F5)", fg_color="#2196F3")
-                    venda_id = self.id_venda_em_edicao
-                else:
-                    cursor.execute("INSERT INTO historico (data, cliente, total, forma, taxa, itens_json) VALUES (?,?,?,?,?,?)",
-                                   (data_hora, cli, total, pgto, tx, json.dumps(self.carrinho)))
-                    venda_id = cursor.lastrowid
-                
-                conn.commit()
-            
-            if imprimir:
-                cupom = self.gerar_layout_cupom(venda_id if venda_id else 0, cli, end, self.carrinho, self.total_itens, tx, total, pgto, val_pago)
-                self.enviar_para_impressora(cupom)
-            
+                    if cli != "CONSUMIDOR":
+                        cursor.execute("SELECT id FROM clientes WHERE nome=?", (cli,))
+                        if not cursor.fetchone():
+                            cursor.execute("INSERT INTO clientes (nome, endereco) VALUES (?,?)", (cli, end))
+
+                    if self.id_venda_em_edicao:
+                        cursor.execute("SELECT itens_json FROM historico WHERE id=?", (self.id_venda_em_edicao,))
+                        r_antigo = cursor.fetchone()
+                        if r_antigo and r_antigo[0]:
+                            try:
+                                itens_antigos = json.loads(r_antigo[0])
+                                if isinstance(itens_antigos, list):
+                                    for item_antigo in itens_antigos:
+                                        if not isinstance(item_antigo, dict):
+                                            continue
+                                        nome_antigo = item_antigo.get('n')
+                                        qtd_antiga = item_antigo.get('q')
+                                        if not nome_antigo or qtd_antiga is None:
+                                            continue
+                                        try:
+                                            qtd_antiga_float = float(qtd_antiga)
+                                        except (TypeError, ValueError):
+                                            continue
+                                        cursor.execute("UPDATE prods SET estoque = estoque + ? WHERE nome = ?",
+                                                       (qtd_antiga_float, nome_antigo))
+                            except Exception:
+                                pass
+
+                    for item in self.carrinho:
+                        if not isinstance(item, dict):
+                            continue
+                        nome_item = item.get('n')
+                        qtd_item = item.get('q')
+                        if not nome_item or qtd_item is None:
+                            continue
+                        try:
+                            qtd_float = float(qtd_item)
+                        except (TypeError, ValueError):
+                            continue
+                        cursor.execute("UPDATE prods SET estoque = estoque - ? WHERE nome = ?", (qtd_float, nome_item))
+
+                    if self.id_venda_em_edicao:
+                        venda_id = self.id_venda_em_edicao
+                        cursor.execute("UPDATE historico SET data=?, cliente=?, total=?, forma=?, taxa=?, itens_json=? WHERE id=?",
+                                       (data_hora, cli, total, pgto, tx, json.dumps(self.carrinho), self.id_venda_em_edicao))
+                        self.id_venda_em_edicao = None
+                    else:
+                        cursor.execute("INSERT INTO historico (data, cliente, total, forma, taxa, itens_json) VALUES (?,?,?,?,?,?)",
+                                       (data_hora, cli, total, pgto, tx, json.dumps(self.carrinho)))
+                        venda_id = cursor.lastrowid
+
+                    conn.commit()
+
+                if imprimir:
+                    cupom = self.gerar_layout_cupom(venda_id if venda_id else 0, cli, end, self.carrinho, self.total_itens, tx, total, pgto, val_pago)
+                    self.enviar_para_impressora(cupom)
+
+                self.after(0, self._finalizar_venda_ui, imprimir, cli, end, tx, val_pago, venda_id)
+            except sqlite3.Error as e:
+                self.after(0, lambda: messagebox.showerror("Erro", str(e)))
+
+        def _finalizar_venda_ui(imprimir, cli, end, tx, val_pago, venda_id):
             self.carrinho = []
             self.renderizar_carrinho()
             self.ent_cli.delete(0, 'end'); self.ent_end.delete(0, 'end')
             self.ent_taxa_entrega.delete(0, 'end'); self.ent_valor_pago.delete(0, 'end')
-            self.atualizar_totais(); self.atualizar_lista_vendas(); self.atualizar_lista_produtos()
-            
+            self.atualizar_totais(); self._agendar_refresh_geral()
+            if self.id_venda_em_edicao is None:
+                self.lbl_modo_edicao.pack_forget()
+                self.btn_salvar_apenas.configure(text="SALVAR (F4)")
+                self.btn_finalizar.configure(text="IMPRIMIR (F5)", fg_color="#2196F3")
             msg = "Venda Salva e Impressa!" if imprimir else "Venda Salva (Sem Imprimir)!"
             messagebox.showinfo("Sucesso", msg)
-        except sqlite3.Error as e:
-            messagebox.showerror("Erro", str(e))
+
+        self._executar_em_thread(tarefa)
 
     # --- GERENCIAMENTO PRODUTOS ---
     def salvar_produto(self):
-        nome = self.ent_p_nome.get().upper()
+        nome = self.normalizar_nome(self.ent_p_nome.get())
         preco = self.safe_float(self.ent_p_preco.get())
-        if not nome: return
-        
-        with self.get_db_connection() as conn:
-            cursor = conn.cursor()
+        if not nome:
+            return
+
+        def tarefa():
+            try:
+                with self.get_db_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT id, nome FROM prods")
+                    registros = cursor.fetchall()
+                    nome_existente = None
+                    for pid, nome_db in registros:
+                        if self.normalizar_nome(nome_db) == nome and (not self.id_prod_em_edicao or pid != self.id_prod_em_edicao):
+                            nome_existente = nome_db
+                            break
+
+                    if nome_existente and not self.id_prod_em_edicao:
+                        self.after(0, lambda: messagebox.showwarning("Produto já existe",
+                            f"Já existe um produto chamado '{nome_existente}'.\nUse EDITAR na lista para alterá-lo, em vez de cadastrar de novo."))
+                        return
+
+                    if self.id_prod_em_edicao:
+                        cursor.execute("UPDATE prods SET nome=?, preco=? WHERE id=?", (nome, preco, self.id_prod_em_edicao))
+                    else:
+                        cursor.execute("INSERT INTO prods (nome, preco, estoque) VALUES (?,?,0)", (nome, preco))
+                    conn.commit()
+
+                self.after(0, self._finalizar_salvar_produto)
+            except sqlite3.Error as exc:
+                self.after(0, lambda: messagebox.showerror("Erro", str(exc)))
+
+        def _finalizar_salvar_produto():
+            self._agendar_refresh_geral()
+            self.ent_p_nome.delete(0,'end'); self.ent_p_preco.delete(0,'end')
             if self.id_prod_em_edicao:
-                cursor.execute("UPDATE prods SET nome=?, preco=? WHERE id=?", (nome, preco, self.id_prod_em_edicao))
                 self.cancelar_edicao_prod()
-            else:
-                cursor.execute("INSERT INTO prods (nome, preco, estoque) VALUES (?,?,0)", (nome, preco))
-            conn.commit()
-        
-        self.atualizar_lista_produtos()
-        self.ent_p_nome.delete(0,'end'); self.ent_p_preco.delete(0,'end')
+
+        self._executar_em_thread(tarefa)
 
     def dar_entrada_estoque(self):
-        nome = self.ent_entrada_busca.get().upper()
+        nome = self.normalizar_nome(self.ent_entrada_busca.get())
         qtd = self.safe_int(self.ent_entrada_qtd.get())
-        data_hora = datetime.now().strftime("%d/%m/%Y %H:%M")
-        if not nome or qtd <= 0: return messagebox.showwarning("Erro", "Selecione e digite qtd.")
-        
-        with self.get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, estoque FROM prods WHERE nome=?", (nome,))
-            res = cursor.fetchone()
+        if not nome or qtd <= 0:
+            return self.after(0, lambda: messagebox.showwarning("Erro", "Selecione e digite qtd."))
+
+        def tarefa():
+            res = self._buscar_produto_por_nome(nome)
             if res:
-                novo_estoque = res[1] + qtd
-                cursor.execute("UPDATE prods SET estoque=? WHERE id=?", (novo_estoque, res[0]))
-                cursor.execute("INSERT INTO entradas_estoque (nome_prod, qtd, data) VALUES (?,?,?)", (nome, qtd, data_hora))
-                conn.commit()
-                messagebox.showinfo("Sucesso", f"Add {qtd}un ao estoque de {nome}.\nTotal: {novo_estoque}")
-                self.ent_entrada_busca.delete(0, 'end'); self.ent_entrada_qtd.delete(0, 'end')
-                self.atualizar_lista_produtos()
+                pid, nome_real, _, estoque_atual = res
+                novo_estoque = estoque_atual + qtd
+                data_hora = datetime.now().strftime("%d/%m/%Y %H:%M")
+                try:
+                    with self.get_db_connection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("UPDATE prods SET estoque=? WHERE id=?", (novo_estoque, pid))
+                        cursor.execute("INSERT INTO entradas_estoque (nome_prod, qtd, data) VALUES (?,?,?)", (nome_real.upper(), qtd, data_hora))
+                        conn.commit()
+                    self.after(0, lambda: self._finalizar_entrada_estoque(nome_real, qtd, novo_estoque))
+                except sqlite3.Error as exc:
+                    self.after(0, lambda: messagebox.showerror("Erro", str(exc)))
             else:
-                messagebox.showerror("Erro", "Produto não cadastrado.")
+                self.after(0, lambda: messagebox.showerror("Erro", "Produto não cadastrado."))
+
+        def _finalizar_entrada_estoque(nome_real, qtd, novo_estoque):
+            messagebox.showinfo("Sucesso", f"Add {qtd}un ao estoque de {nome_real}.\nTotal: {novo_estoque}")
+            self.ent_entrada_busca.delete(0, 'end'); self.ent_entrada_qtd.delete(0, 'end')
+            self._agendar_refresh_geral()
+
+        self._executar_em_thread(tarefa)
 
     def calcular_movimentacoes_hoje(self):
         hoje = datetime.now().strftime("%d/%m/%Y")
@@ -800,6 +1431,12 @@ class SistemaComanda(ctk.CTk):
     # =========================================================================
 
     def atualizar_lista_produtos(self):
+        self._agendar_refresh_lista("produtos", self._realizar_atualizacao_produtos, delay=150)
+
+    def _realizar_atualizacao_produtos(self):
+        if self._lista_busy.get("produtos"):
+            return
+        self._lista_busy["produtos"] = True
         for i in self.tree_prod.get_children(): self.tree_prod.delete(i)
         termo = self.ent_busca_prod.get().upper()
         t = threading.Thread(target=self._thread_buscar_produtos, args=(termo,))
@@ -811,17 +1448,34 @@ class SistemaComanda(ctk.CTk):
                 cur = conn.cursor()
                 cur.execute("SELECT id, nome, preco, estoque FROM prods WHERE nome LIKE ? ORDER BY nome LIMIT 50", (f'%{termo}%',))
                 resultados = cur.fetchall()
-            self.after(0, self._callback_desenhar_produtos, resultados)
+            self.after(0, self._thread_buscar_movimentos_produtos, resultados)
         except Exception as e: print(f"Erro Thread Prod: {e}")
 
-    def _callback_desenhar_produtos(self, resultados):
-        movs = self.calcular_movimentacoes_hoje()
-        for pid, nome, preco, estoque in resultados:
-            qtd_saiu = movs.get(nome, {}).get('saiu', 0)
-            tag = "baixo" if estoque < 10 else "normal"
-            self.tree_prod.insert("", "end", values=(pid, nome, f"R$ {preco:.2f}", estoque, int(qtd_saiu)), tags=(tag,))
+    def _thread_buscar_movimentos_produtos(self, resultados):
+        try:
+            def worker():
+                movs = self.calcular_movimentacoes_hoje()
+                self.after(0, self._callback_desenhar_produtos, resultados, movs)
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            self.after(0, self._callback_desenhar_produtos, resultados, {})
+
+    def _callback_desenhar_produtos(self, resultados, movs):
+        try:
+            for pid, nome, preco, estoque in resultados:
+                qtd_saiu = movs.get(nome, {}).get('saiu', 0)
+                tag = "baixo" if estoque < 10 else "normal"
+                self.tree_prod.insert("", "end", values=(pid, nome, f"R$ {preco:.2f}", estoque, int(qtd_saiu)), tags=(tag,))
+        finally:
+            self._lista_busy["produtos"] = False
 
     def atualizar_lista_clientes(self):
+        self._agendar_refresh_lista("clientes", self._realizar_atualizacao_clientes, delay=150)
+
+    def _realizar_atualizacao_clientes(self):
+        if self._lista_busy.get("clientes"):
+            return
+        self._lista_busy["clientes"] = True
         for i in self.tree_cli.get_children(): self.tree_cli.delete(i)
         termo = self.ent_busca_cli.get().upper()
         t = threading.Thread(target=self._thread_buscar_clientes, args=(termo,))
@@ -837,10 +1491,19 @@ class SistemaComanda(ctk.CTk):
         except Exception as e: print(f"Erro Thread Cli: {e}")
 
     def _callback_desenhar_clientes(self, resultados):
-        for cid, nome, end in resultados:
-            self.tree_cli.insert("", "end", values=(cid, nome, end))
+        try:
+            for cid, nome, end in resultados:
+                self.tree_cli.insert("", "end", values=(cid, nome, end))
+        finally:
+            self._lista_busy["clientes"] = False
 
     def atualizar_lista_vendas(self):
+        self._agendar_refresh_lista("vendas", self._realizar_atualizacao_vendas, delay=150)
+
+    def _realizar_atualizacao_vendas(self):
+        if self._lista_busy.get("vendas"):
+            return
+        self._lista_busy["vendas"] = True
         for i in self.tree_rel.get_children(): self.tree_rel.delete(i)
         f_id = self.ent_id_rel.get().strip()
         f_data = self.ent_data_rel.get().strip()
@@ -864,8 +1527,11 @@ class SistemaComanda(ctk.CTk):
         except Exception as e: print(f"Erro Thread Vendas: {e}")
 
     def _callback_desenhar_vendas(self, resultados):
-        for vid, d, c, t, f in resultados:
-            self.tree_rel.insert("", "end", values=(vid, d, c, f"R$ {t:.2f}", f))
+        try:
+            for vid, d, c, t, f in resultados:
+                self.tree_rel.insert("", "end", values=(vid, d, c, f"R$ {t:.2f}", f))
+        finally:
+            self._lista_busy["vendas"] = False
 
     def excluir_produtos_selecionados(self):
         selected = self.tree_prod.selection()
@@ -897,25 +1563,53 @@ class SistemaComanda(ctk.CTk):
         self.btn_cancelar_prod.pack_forget()
 
     def salvar_cliente(self):
-        nome = self.ent_c_nome.get().upper(); end = self.ent_c_end.get().upper()
-        if not nome: return
-        with self.get_db_connection() as conn:
-            cursor = conn.cursor()
+        nome = self.normalizar_nome(self.ent_c_nome.get())
+        end = self.ent_c_end.get().upper().strip()
+        if not nome:
+            return
+
+        def tarefa():
+            try:
+                with self.get_db_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT id, nome FROM clientes")
+                    registros = cursor.fetchall()
+                    nome_existente = None
+                    for cid, nome_db in registros:
+                        if self.normalizar_nome(nome_db) == nome and (not self.id_cliente_em_edicao or cid != self.id_cliente_em_edicao):
+                            nome_existente = nome_db
+                            break
+
+                    if nome_existente and not self.id_cliente_em_edicao:
+                        self.after(0, lambda: messagebox.showwarning("Cliente já existe",
+                            f"Já existe um cliente chamado '{nome_existente}'.\nUse EDITAR na lista para alterá-lo, em vez de cadastrar de novo."))
+                        return
+
+                    if self.id_cliente_em_edicao:
+                        cursor.execute("UPDATE clientes SET nome=?, endereco=? WHERE id=?", (nome, end, self.id_cliente_em_edicao))
+                    else:
+                        cursor.execute("INSERT INTO clientes (nome, endereco) VALUES (?,?)", (nome, end))
+                    conn.commit()
+
+                self.after(0, self._finalizar_salvar_cliente)
+            except sqlite3.Error as exc:
+                self.after(0, lambda: messagebox.showerror("Erro", str(exc)))
+
+        def _finalizar_salvar_cliente():
+            self._agendar_refresh_geral(); self.ent_c_nome.delete(0,'end'); self.ent_c_end.delete(0,'end')
             if self.id_cliente_em_edicao:
-                cursor.execute("UPDATE clientes SET nome=?, endereco=? WHERE id=?", (nome, end, self.id_cliente_em_edicao))
                 self.cancelar_edicao_cli()
-            else:
-                cursor.execute("INSERT INTO clientes (nome, endereco) VALUES (?,?)", (nome, end))
-            conn.commit()
-        
-        self.atualizar_lista_clientes(); self.ent_c_nome.delete(0,'end'); self.ent_c_end.delete(0,'end')
+
+        self._executar_em_thread(tarefa)
 
     def buscar_endereco_cliente(self):
-        with self.get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT endereco FROM clientes WHERE nome=?", (self.ent_cli.get().upper(),))
-            r = cursor.fetchone()
-        if r: self.ent_end.delete(0, 'end'); self.ent_end.insert(0, r[0])
+        nome = self.normalizar_nome(self.ent_cli.get())
+        if not nome:
+            return
+        resultado = self._buscar_cliente_por_nome(nome)
+        if resultado:
+            _, nome_db, endereco = resultado
+            self.ent_end.delete(0, 'end'); self.ent_end.insert(0, endereco)
 
     def excluir_clientes_selecionados(self):
         selected = self.tree_cli.selection()
@@ -955,37 +1649,56 @@ class SistemaComanda(ctk.CTk):
 
     def reimprimir_cupom(self):
         selected = self.tree_rel.selection()
-        if len(selected) != 1: return
+        if len(selected) != 1:
+            return
         vid = self.tree_rel.item(selected[0], "values")[0]
         with self.get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM historico WHERE id=?", (vid,))
             r = cursor.fetchone()
-        
-        carrinho = json.loads(r[6])
+
+        if not r:
+            messagebox.showwarning("Venda", "Registro da venda não foi encontrado.")
+            return
+
+        try:
+            carrinho = json.loads(r[6]) if r[6] else []
+        except Exception:
+            carrinho = []
+
         cupom = self.gerar_layout_cupom(r[0], r[2], "", carrinho, r[3]-r[5], r[5], r[3], r[4])
         self.enviar_para_impressora(cupom)
 
     def editar_venda_antiga(self):
         selected = self.tree_rel.selection()
-        if len(selected) != 1: return
-        if not messagebox.askyesno("Confirmar", "Editar venda?"): return
+        if len(selected) != 1:
+            return
+        if not messagebox.askyesno("Confirmar", "Editar venda?"):
+            return
         vid = self.tree_rel.item(selected[0], "values")[0]
-        
+
         with self.get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM historico WHERE id=?", (vid,))
             r = cursor.fetchone()
-            
+
+        if not r:
+            messagebox.showwarning("Venda", "Registro da venda não foi encontrado.")
+            return
+
+        try:
+            carrinho = json.loads(r[6]) if r[6] else []
+        except Exception:
+            carrinho = []
+
         self.id_venda_em_edicao = r[0]
         self.ent_cli.delete(0,'end'); self.ent_cli.insert(0, r[2])
         self.forma_pagamento.set(r[4])
         self.ent_taxa_entrega.delete(0,'end'); self.ent_taxa_entrega.insert(0, str(r[5]))
-        self.carrinho = json.loads(r[6])
-        
-        # Renderiza usando a nova Treeview
+        self.carrinho = carrinho if isinstance(carrinho, list) else []
+
         self.renderizar_carrinho()
-        
+
         self.lbl_modo_edicao.pack(fill="x", pady=5)
         self.btn_salvar_apenas.configure(text="SALVAR ALTERAÇÃO (F4)")
         self.btn_finalizar.configure(text=f"SALVAR E IMPRIMIR (F5)", fg_color="red")
@@ -993,41 +1706,38 @@ class SistemaComanda(ctk.CTk):
 
     # --- RELATÓRIOS (IMPRESSÃO TÉRMICA ATUALIZADA) ---
     def relatorio_geral_dia(self):
+        if self._ui_busy:
+            return
+        self._executar_em_thread(self._relatorio_geral_dia_real)
+
+    def _relatorio_geral_dia_real(self):
         hoje = datetime.now().strftime("%d/%m/%Y")
-        
-        # 1. Busca Financeiro
+
         with self.get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT forma, COUNT(*), SUM(total) FROM historico WHERE data LIKE ? GROUP BY forma", (f"{hoje}%",))
             dados_vendas = cursor.fetchall()
-            
-        # 2. Busca Itens Vendidos (Usando a nova função)
+
         dados_itens_vendidos = self.calcular_produtos_vendidos_hoje()
 
-        # 3. Monta o texto
         txt = "\nFECHAMENTO GERAL DO DIA\n" + f"DATA: {hoje}\n" + "="*48 + "\n"
-        
-        # Bloco Financeiro
         txt += ">>> VENDAS (FINANCEIRO)\n"
         txt += f"{'FORMA':<20} {'QTD':^6} {'VALOR':>18}\n" + "-"*48 + "\n"
-        
+
         geral_val = 0.0; geral_qtd = 0
         for f, qtd, v in dados_vendas:
             if f:
                 txt += f"{f:<20} {qtd:^6} R$ {v:>13.2f}\n"
                 geral_val += v; geral_qtd += qtd
-        
+
         txt += "="*48 + "\n"
         txt += f"TOTAL GERAL:         {geral_qtd:^6} R$ {geral_val:>13.2f}\n\n\n"
-        
-        # Bloco de Produtos Vendidos (Alterado)
         txt += "="*48 + "\n"
         txt += ">>> RESUMO DE ITENS VENDIDOS (SAIDAS)\n"
         txt += f"{'PRODUTO':<36} {'QTD':^10}\n" + "-"*48 + "\n"
-        
+
         total_itens_dia = 0
         for nome, qtd in dados_itens_vendidos:
-            # Formata para não mostrar casas decimais se for número inteiro
             qtd_fmt = f"{qtd:.0f}" if qtd.is_integer() else f"{qtd:.2f}"
             txt += f"{nome[:36]:<36} {qtd_fmt:^10}\n"
             total_itens_dia += qtd
@@ -1035,8 +1745,8 @@ class SistemaComanda(ctk.CTk):
         txt += "-"*48 + "\n"
         txt += f"{'TOTAL DE ITENS:':<36} {total_itens_dia:.0f}\n"
         txt += "="*48 + "\n\n\n"
-        
-        self.enviar_para_impressora(txt)
+
+        self.after(0, self.enviar_para_impressora, txt)
 
 if __name__ == "__main__":
     app = SistemaComanda()
