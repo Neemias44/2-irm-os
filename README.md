@@ -15,7 +15,6 @@ Sistema de vendas e estoque para a distribuidora de água e gás Dois Irmãos.
   - formas de pagamento (valor e %) e produtos mais vendidos;
   - passe o mouse numa barra para ver os detalhes;
   - **GERAR PDF** e **IMPRIMIR RESUMO** usam o mesmo período.
-- **Celular:** página de estoque na rede Wi-Fi local em `http://<ip-do-pc>:5000` (botão "IP CELULAR").
 - **Backup:** automático uma vez por dia e manual pelo botão "SALVAR INFORMAÇÕES", na pasta `backups/`.
 - **Backup no Drive (fora do computador):** botão "☁️ BACKUP NO DRIVE" (o ⚙ ao lado troca a pasta). Na primeira vez, escolha a pasta do Google Drive, do OneDrive ou do pendrive. Depois disso:
   - é feito **sozinho ao fechar o programa** no fim do dia;
@@ -45,7 +44,7 @@ pyinstaller app.spec
 - Os itens de cada venda ficam na tabela `itens_venda`, ligados ao produto pelo ID. Por isso, renomear um produto não quebra o estoque nem os relatórios.
 - As datas também são gravadas em formato ordenável (`data_iso`), com índice, e os relatórios por período são calculados direto no SQL.
 - Bancos antigos são atualizados sozinhos na primeira abertura. Antes disso é feita uma cópia em `backups/loja_antes_v2_*.db`.
-- O banco usa o modo WAL, então o celular pode ler enquanto o sistema grava. Enquanto o programa está aberto, existem os arquivos `loja.db-wal` e `loja.db-shm`. **Para copiar o banco para outro PC, feche o programa antes** (ou use o botão "SALVAR INFORMAÇÕES" e copie o backup).
+- O banco usa o modo WAL, então backups e relatórios podem ler enquanto o sistema grava. Enquanto o programa está aberto, existem os arquivos `loja.db-wal` e `loja.db-shm`. **Para copiar o banco para outro PC, feche o programa antes** (ou use o botão "SALVAR INFORMAÇÕES" e copie o backup).
 
 ## Arquivos
 

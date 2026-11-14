@@ -1,4 +1,3 @@
 customtkinter
 reportlab
-flask
 pywin32; sys_platform == "win32"

@@ -6,7 +6,6 @@ import queue
 import sys
 import tempfile
 import threading
-import socket
 import textwrap
 from datetime import datetime, timedelta
 from tkinter import messagebox, filedialog, ttk
@@ -26,14 +25,6 @@ try:
 except ImportError:
     TEM_REPORTLAB = False
     print("AVISO: Para gerar PDF, instale: pip install reportlab")
-
-# --- TENTA IMPORTAR O FLASK PARA O CELULAR ---
-try:
-    from flask import Flask, render_template_string
-    TEM_FLASK = True
-except ImportError:
-    TEM_FLASK = False
-    print("AVISO: Instale o flask para ver no celular: pip install flask")
 
 # --- CONFIGURAÇÃO VISUAL ---
 ctk.set_appearance_mode("Dark")
@@ -56,7 +47,7 @@ ARQUIVO_DB = os.path.join(PASTA_APP, "loja.db")
 PASTA_BACKUP = os.path.join(PASTA_APP, "backups")
 ARQUIVO_CONFIG = os.path.join(PASTA_APP, "config.json")
 ARQUIVO_LOG_TRAVAS = os.path.join(PASTA_APP, "travamentos.log")
-ESTOQUE_MINIMO = 10      # abaixo disso o produto aparece em vermelho (PC e celular)
+ESTOQUE_MINIMO = 10      # abaixo disso o produto aparece em vermelho
 
 CORES_STATUS = {"ok": "#4CAF50", "aviso": "#FFC107", "erro": "#ff5555", "info": "#9e9e9e"}
 
@@ -164,7 +155,6 @@ class SistemaComanda(ctk.CTk):
         self.id_venda_em_edicao = None
         self.carrinho = []
         self.total_itens = 0.0
-        self.ip_local = self.pegar_ip()
         self._salvando_venda = False
         self._refresh_jobs = {}
         self._seq_listas = {}
@@ -190,8 +180,6 @@ class SistemaComanda(ctk.CTk):
             raise SystemExit(1)
 
         self.estilizar_treeview()
-        if TEM_FLASK:
-            self.iniciar_servidor_celular()
 
         # Barra de status (avisos que NÃO travam a tela)
         self.barra_status = ctk.CTkFrame(self, height=34, corner_radius=0, fg_color="#1e1e1e")
@@ -489,16 +477,6 @@ class SistemaComanda(ctk.CTk):
         qtd = self.safe_float(qtd)
         return f"{qtd:.0f}" if qtd.is_integer() else f"{qtd:.2f}"
 
-    def pegar_ip(self):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
-            return "127.0.0.1"
-
     def _ids_selecionados(self, tree):
         return [self.safe_int(tree.item(i, "values")[0]) for i in tree.selection()]
 
@@ -537,54 +515,6 @@ class SistemaComanda(ctk.CTk):
         caixa.see("end")
         caixa.configure(state="disabled")
         ctk.CTkButton(janela, text="Fechar", command=janela.destroy).pack(pady=10)
-
-    # =========================================================================
-    # SERVIDOR CELULAR (FLASK)
-    # =========================================================================
-    def iniciar_servidor_celular(self):
-        if getattr(self, '_servidor_celular_ativo', False):
-            return
-        self._servidor_celular_ativo = True
-        app = Flask(__name__)
-        HTML_TEMPLATE = """
-        <!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Estoque Dois Irmãos</title><meta http-equiv="refresh" content="30">
-        <style>body{font-family:Arial,sans-serif;background:#222;color:#fff;padding:10px} .card{background:#333;padding:15px;margin-bottom:10px;border-left:5px solid #2196F3;display:flex;justify-content:space-between} .low{border-left-color:#f44336} .val{font-size:1.4em;font-weight:bold}</style>
-        </head><body><h2 style="text-align:center;color:#4caf50">📦 Estoque</h2>
-        <p style="text-align:center;color:#aaa">Valor em mercadoria: <b>R$ {{ "%.2f"|format(total_loja) }}</b></p>
-        {% for p in produtos %}
-        <div class="card {% if p[2] < minimo %}low{% endif %}"><div><b>{{p[0]}}</b><br><small>R$ {{ "%.2f"|format(p[1]) }}</small></div><div style="text-align:right"><span class="val">{{ "%g"|format(p[2]) }}</span><br><small>un</small></div></div>
-        {% endfor %}</body></html>
-        """
-
-        @app.route("/")
-        def index():
-            # Conexão própria só de leitura: com o modo WAL ela não bloqueia o sistema
-            try:
-                conn = bd.conectar(ARQUIVO_DB)
-                try:
-                    dados = bd.produtos_para_celular(conn)
-                finally:
-                    conn.close()
-                total_loja = sum(preco * max(estoque, 0) for _, preco, estoque in dados)
-                return render_template_string(HTML_TEMPLATE, produtos=dados, minimo=ESTOQUE_MINIMO, total_loja=total_loja)
-            except Exception as e:
-                print(f"Erro no servidor do celular: {e}")
-                return "Erro ao ler o banco de dados", 500
-
-        def run_server():
-            try:
-                app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
-            except OSError as e:
-                print(f"Aviso: servidor do celular não iniciou: {e}")
-                self._servidor_celular_ativo = False
-
-        threading.Thread(target=run_server, daemon=True).start()
-
-    def mostrar_info_celular(self):
-        if not TEM_FLASK:
-            return messagebox.showwarning("Aviso", "Instale o flask: pip install flask")
-        messagebox.showinfo("Acesso Celular", f"Acesse no navegador do celular:\nhttp://{self.ip_local}:5000")
 
     # =========================================================================
     # IMPRESSÃO (TÉRMICA) — sempre em segundo plano: impressora desligada
@@ -1005,7 +935,6 @@ class SistemaComanda(ctk.CTk):
         self.f_esq = ctk.CTkFrame(self.tab_venda)
         self.f_esq.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
 
-        ctk.CTkButton(self.f_esq, text="📱 IP CELULAR", fg_color="#673AB7", command=self.mostrar_info_celular).pack(fill="x", padx=10, pady=5)
         self.btn_backup = ctk.CTkButton(self.f_esq, text="💾 SALVAR INFORMAÇÕES", fg_color="#009688", command=self.salvar_backup_manual)
         self.btn_backup.pack(fill="x", padx=10, pady=5)
         self.f_drive = f_drive = ctk.CTkFrame(self.f_esq, fg_color="transparent")

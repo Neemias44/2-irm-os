@@ -480,10 +480,6 @@ def excluir_entradas(conn, ids):
     conn.execute(f"DELETE FROM entradas_estoque WHERE id IN ({marcadores})", ids)
 
 
-def produtos_para_celular(conn):
-    return conn.execute("SELECT nome, COALESCE(preco,0), COALESCE(estoque,0) FROM prods ORDER BY nome").fetchall()
-
-
 # =============================================================================
 # CLIENTES
 # =============================================================================
@@ -761,7 +757,7 @@ class Banco:
         self._despachar = despachar
         self._ao_erro = ao_erro
         conn = conectar(caminho)
-        # WAL: o servidor do celular lê enquanto o sistema grava, sem um travar o outro
+        # WAL: leituras (backups, relatórios) não bloqueiam as gravações
         try:
             conn.execute("PRAGMA journal_mode = WAL")
         except sqlite3.Error:
