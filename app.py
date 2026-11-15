@@ -49,6 +49,17 @@ ARQUIVO_CONFIG = os.path.join(PASTA_APP, "config.json")
 ARQUIVO_LOG_TRAVAS = os.path.join(PASTA_APP, "travamentos.log")
 ESTOQUE_MINIMO = 10      # abaixo disso o produto aparece em vermelho
 
+# Comandos ESC/POS da impressora térmica (tamanho da letra)
+ESC_DUPLA = "\x1b\x45\x01\x1d\x21\x11"    # negrito + altura e largura dobradas (24 colunas)
+ESC_ALTA = "\x1b\x45\x01\x1d\x21\x01"     # negrito + altura dobrada (48 colunas)
+ESC_NORMAL = "\x1d\x21\x00\x1b\x45\x00"   # volta ao normal
+
+
+def sem_comandos_impressora(texto):
+    for cmd in (ESC_DUPLA, ESC_ALTA, ESC_NORMAL):
+        texto = texto.replace(cmd, "")
+    return texto
+
 CORES_STATUS = {"ok": "#4CAF50", "aviso": "#FFC107", "erro": "#ff5555", "info": "#9e9e9e"}
 
 
@@ -533,8 +544,9 @@ class SistemaComanda(ctk.CTk):
 
     def _enviar_para_impressora(self, texto):
         if not TEM_IMPRESSORA:
+            # Prévia em .txt: sem os comandos de letra grande (só a impressora entende)
             with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
-                f.write(texto)
+                f.write(sem_comandos_impressora(texto))
             os.startfile(f.name)
             return
         impressora_padrao = win32print.GetDefaultPrinter()
@@ -559,7 +571,15 @@ class SistemaComanda(ctk.CTk):
         LARGURA = 48
         traco = "=" * LARGURA
 
-        txt = "\n" + "DOIS IRMAOS - AGUA E GAS".center(LARGURA) + "\n"
+        # Destaque no topo (pedido da loja): forma de pagamento e produtos em letra grande,
+        # para bater o olho e saber o que levar e como vai ser pago.
+        txt = f"{ESC_DUPLA}{normalizar_texto(pgto)[:LARGURA // 2]}{ESC_NORMAL}\n"
+        for item in carrinho:
+            linha = f"{self._formatar_qtd(item.get('q', 0))} x {item.get('n', '')}"
+            for l in textwrap.wrap(linha, width=LARGURA):
+                txt += f"{ESC_ALTA}{l}{ESC_NORMAL}\n"
+
+        txt += "\n" + "DOIS IRMAOS - AGUA E GAS".center(LARGURA) + "\n"
         txt += f"{traco}\nVENDA #{id_venda:04d} - {data_hora}\n"
 
         prefixo_cli = "Cli: "
